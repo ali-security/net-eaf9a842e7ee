@@ -1,0 +1,117 @@
+
+# Upstream golang.org/x/net has no GitHub Actions CI (it is developed on
+# Gerrit and tested by the Go build dashboard), so this workflow is written
+# from scratch for the sealed build. It mirrors what the project itself does:
+# the toolchain named by the `go` directive in go.mod, `go build ./...` and
+# `go test ./...` over the whole module, plus the module source zip that
+# proxy.golang.org serves as the release artifact.
+name: build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: Space-separated Go test names to run instead of the full suite
+        required: false
+        default: ""
+
+env:
+  GOTOOLCHAIN: auto
+  # The sealed-build time machine (time-machines-go.sealsecurity.io) does not
+  # resolve from GitHub-hosted runners, and it is not needed here: go.mod and
+  # go.sum pin every dependency to an exact version and hash, so the public
+  # proxy resolves the same module graph the release was built against.
+  GOPROXY: https://proxy.golang.org,direct
+
+jobs:
+  build:
+    name: build and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Report toolchain
+        run: go version
+
+      # Build the module zip FIRST, from a pristine copy of the checkout, so no
+      # build or test byproduct can leak into it. The copy also lets us drop
+      # this workflow: upstream ships no .github/ directory, so the published
+      # module zip has no .github members and the artifact must not gain any.
+      - name: Stage module source
+        shell: bash
+        run: |
+          set -eo pipefail
+          cp -a "${GITHUB_WORKSPACE}" /tmp/modsrc
+          rm -rf /tmp/modsrc/.git /tmp/modsrc/.github
+          mkdir -p /tmp/build_output
+
+      # golang.org/x/mod/zip.CreateFromDir is Go's own module-zip writer, so it
+      # applies exactly the proxy's inclusion rules. It lives in its own module
+      # under /tmp so it never touches the library's go.mod.
+      - name: Build module zip
+        shell: bash
+        run: |
+          set -eo pipefail
+          mkdir -p /tmp/zipper
+          cat > /tmp/zipper/create_mod.go <<'EOF'
+          package main
+
+          import (
+              "log"
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              if len(os.Args) != 5 {
+                  log.Fatal("usage: create_mod <module-path> <version> <source-dir> <output-zip>")
+              }
+              m := module.Version{Path: os.Args[1], Version: os.Args[2]}
+              f, err := os.Create(os.Args[4])
+              if err != nil {
+                  log.Fatal(err)
+              }
+              defer f.Close()
+              if err := zip.CreateFromDir(f, m, os.Args[3]); err != nil {
+                  log.Fatal(err)
+              }
+              log.Printf("created module zip: %s", os.Args[4])
+          }
+          EOF
+          cd /tmp/zipper
+          go mod init example.com/zipper
+          go get golang.org/x/mod
+          go run ./create_mod.go golang.org/x/net v0.45.0 /tmp/modsrc /tmp/build_output/v0.45.0.zip
+          unzip -l /tmp/build_output/v0.45.0.zip | tail -n 5
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        shell: bash
+        run: |
+          set -eo pipefail
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            go test -v -run "^($(echo "${{ inputs.test-filter }}" | tr ' ' '|'))$" ./... 2>&1 | tee /tmp/scoped.log
+            for t in ${{ inputs.test-filter }}; do
+              grep -qE "^=== RUN[[:space:]]+${t}(/|$)" /tmp/scoped.log || exit 1
+            done
+          else
+            go test ./...
+          fi
+
+      - name: Upload module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: /tmp/build_output/v0.45.0.zip
+          if-no-files-found: error
